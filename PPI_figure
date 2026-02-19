@@ -1,0 +1,188 @@
+# ==========================================================
+# DDR1 KO – Hub-Centered Core STRING Network (Organic Layout, Larger Labels)
+# ==========================================================
+
+# ----------------------------------------------------------
+# Load libraries
+# ----------------------------------------------------------
+library(ggplot2)
+library(ggraph)
+library(igraph)
+library(readxl)
+library(dplyr)
+library(biomaRt)
+library(STRINGdb)
+
+# ----------------------------------------------------------
+# 1️⃣ Load Data
+# ----------------------------------------------------------
+IGROV <- read_excel("C:/Users/mrzsjs1/Downloads/IGROV.xlsx")
+T47D  <- read_excel("C:/Users/mrzsjs1/Downloads/T47D.xlsx")
+
+IGROV$ensembl_clean <- sub("\\..*", "", IGROV$ensembl_transcript_id_version)
+T47D$ensembl_clean  <- sub("\\..*", "", T47D$ensembl_transcript_id_version)
+
+# ----------------------------------------------------------
+# 2️⃣ Map Ensembl → HGNC Symbols
+# ----------------------------------------------------------
+mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+
+convert_ids <- function(ids) {
+  getBM(attributes=c("ensembl_transcript_id","hgnc_symbol"),
+        filters="ensembl_transcript_id",
+        values=ids,
+        mart=mart)
+}
+
+IGROV <- merge(
+  IGROV,
+  convert_ids(unique(IGROV$ensembl_clean)),
+  by.x="ensembl_clean",
+  by.y="ensembl_transcript_id"
+) %>% dplyr::filter(hgnc_symbol != "")
+
+T47D <- merge(
+  T47D,
+  convert_ids(unique(T47D$ensembl_clean)),
+  by.x="ensembl_clean",
+  by.y="ensembl_transcript_id"
+) %>% dplyr::filter(hgnc_symbol != "")
+
+igrov_genes <- unique(IGROV$hgnc_symbol)
+t47d_genes  <- unique(T47D$hgnc_symbol)
+
+overlap_genes <- intersect(igrov_genes, t47d_genes)
+unique_IGROV  <- setdiff(igrov_genes, t47d_genes)
+unique_T47D   <- setdiff(t47d_genes, igrov_genes)
+
+# ----------------------------------------------------------
+# 3️⃣ STRINGdb – Map & Interactions (High-confidence)
+# ----------------------------------------------------------
+string_db <- STRINGdb$new(
+  version="11.5",
+  species=9606,
+  score_threshold=900  # stricter threshold for high-confidence edges
+)
+
+all_genes <- unique(c(unique_IGROV, unique_T47D, overlap_genes))
+gene_df <- data.frame(gene=all_genes, stringsAsFactors=FALSE)
+
+mapped <- string_db$map(gene_df, "gene", removeUnmappedRows=TRUE)
+
+interactions <- string_db$get_interactions(mapped$STRING_id)
+interactions <- interactions[interactions$combined_score >= 900, ]
+
+# ----------------------------------------------------------
+# 4️⃣ Nodes & top filtering (~600)
+# ----------------------------------------------------------
+all_nodes <- c(interactions$from, interactions$to)
+node_counts <- as.data.frame(table(all_nodes))
+node_counts <- node_counts[order(-node_counts$Freq), ]
+top600_ids <- as.character(head(node_counts$all_nodes, 600))
+
+interactions <- interactions[
+  interactions$from %in% top600_ids & interactions$to %in% top600_ids,
+]
+
+vertices <- data.frame(
+  name=unique(c(interactions$from, interactions$to)),
+  stringsAsFactors=FALSE
+)
+vertices$gene <- mapped$gene[match(vertices$name, mapped$STRING_id)]
+
+# ----------------------------------------------------------
+# 5️⃣ Build Hub-Centered Network (top hubs + limited neighbors)
+# ----------------------------------------------------------
+build_publication_network <- function(unique_set, core_set, top_core_n=8, max_neighbors=10) {
+  
+  unique_ids <- mapped$STRING_id[mapped$gene %in% unique_set]
+  core_ids   <- mapped$STRING_id[mapped$gene %in% core_set]
+  
+  # Keep interactions among unique + core
+  sub_edges <- interactions[
+    (interactions$from %in% c(unique_ids, core_ids) &
+       interactions$to %in% c(unique_ids, core_ids)),
+  ]
+  
+  if (nrow(sub_edges) == 0) return(make_empty_graph())
+  
+  sub_vertices <- vertices[
+    vertices$name %in%
+      unique(c(sub_edges$from, sub_edges$to)),
+  ]
+  
+  g <- graph_from_data_frame(
+    sub_edges[, c("from", "to")],
+    directed = FALSE,
+    vertices = sub_vertices
+  )
+  
+  # Identify top core hubs by degree
+  deg <- degree(g)
+  core_deg <- deg[V(g)$gene %in% core_set]
+  if (length(core_deg) == 0) return(g)
+  
+  top_n <- min(top_core_n, length(core_deg))
+  top_core_ids <- names(sort(core_deg, decreasing=TRUE))[1:top_n]
+  
+  # Keep hubs + limited neighbors
+  neighbors_of_hubs <- unique(unlist(
+    lapply(top_core_ids, function(x) {
+      nbrs <- names(neighbors(g, x))
+      if (length(nbrs) > max_neighbors) nbrs <- nbrs[1:max_neighbors]
+      nbrs
+    })
+  ))
+  
+  keep_nodes <- unique(c(top_core_ids, neighbors_of_hubs))
+  g <- induced_subgraph(g, keep_nodes)
+  
+  return(list(graph = g, hubs = top_core_ids))
+}
+
+# ----------------------------------------------------------
+# 6️⃣ Organic Fruchterman-Reingold layout for publication
+# ----------------------------------------------------------
+plot_publication_network <- function(graph_obj, title_text) {
+  graph <- graph_obj$graph
+  top_core <- graph_obj$hubs
+  
+  if (vcount(graph) == 0) {
+    message("No qualifying interactions for: ", title_text)
+    return(NULL)
+  }
+  
+  deg <- degree(graph)
+  V(graph)$group <- ifelse(V(graph)$gene %in% overlap_genes, "Core", "Unique")
+  V(graph)$size <- ifelse(V(graph)$group=="Core", 10 + deg*0.8, 4 + deg*0.4)
+  V(graph)$fill_col <- ifelse(V(graph)$group=="Core", "#D62728", "#1F77B4")
+  
+  # Organic layout
+  set.seed(123)
+  layout_fr <- layout_with_fr(graph, niter=500)
+  
+  ggraph(graph, layout = layout_fr) +
+    geom_edge_link(color="grey70", alpha=0.6, width=0.7) +
+    geom_node_point(aes(size=size, fill=fill_col), shape=21, color="black", stroke=0.7, alpha=0.95) +
+    # Larger node labels for publication
+    geom_node_text(aes(label=ifelse(name %in% top_core, gene, "")),
+                   repel=TRUE, max.overlaps=Inf, size=6, fontface="bold") +
+    scale_fill_identity() +
+    theme_void() +
+    ggtitle(title_text) +
+    theme(plot.title = element_text(size=17, face="bold", hjust=0.5))
+}
+
+# ----------------------------------------------------------
+# 7️⃣ Generate IGROV Figure
+# ----------------------------------------------------------
+sub_igrov <- build_publication_network(unique_IGROV, overlap_genes)
+dev.new()
+plot_publication_network(sub_igrov, "DDR1 KO – IGROV Unique Connections to Shared Core")
+
+# ----------------------------------------------------------
+# 8️⃣ Generate T47D Figure
+# ----------------------------------------------------------
+sub_t47d <- build_publication_network(unique_T47D, overlap_genes)
+dev.new()
+plot_publication_network(sub_t47d, "DDR1 KO – T47D Unique Connections to Shared Core")
