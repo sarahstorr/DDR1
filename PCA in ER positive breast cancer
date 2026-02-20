@@ -1,0 +1,157 @@
+# ==========================================================
+# Full ER-positive PCA + survival figures
+# ==========================================================
+library(readxl)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(factoextra)
+
+# ----------------------------------------------------------
+# Load data
+# ----------------------------------------------------------
+data <- read_excel("C:/Users/mrzsjs1/Desktop/DDR1 paper/IHCbreast.xlsx")
+
+# Ensure correct variable types
+data$DSS <- as.numeric(data$DSS)
+data$Survival_month <- as.numeric(data$Survival_month)
+data$ER_status <- as.factor(data$ER_status)
+
+# ----------------------------------------------------------
+# Filter ER-positive patients
+# ----------------------------------------------------------
+data_ERpos <- data %>% filter(ER_status == 1)
+
+# Define protein columns for PCA
+protein_cols <- c(
+  "CREB1",
+  "PhoshoT34_Cyto",
+  "PhosphoT34_Nuclear",
+  "PKA",
+  "DDR1",
+  "DARPP32_Cyto",
+  "DARPP32_Nuclear",
+  "PP1_Cyto",
+  "PP1_Nuclear",
+  "CDK5_Cyto",
+  "CDK5_Nuclear"
+)
+
+# Remove missing values
+data_ERpos <- data_ERpos %>% drop_na(all_of(protein_cols))
+
+# ----------------------------------------------------------
+# Z-score proteins
+# ----------------------------------------------------------
+protein_scaled <- scale(data_ERpos[, protein_cols])
+
+# ----------------------------------------------------------
+# PCA
+# ----------------------------------------------------------
+pca_result <- prcomp(protein_scaled, center = TRUE, scale. = TRUE)
+
+# Add PC1 scores to dataset
+data_ERpos$PC1 <- pca_result$x[,1]
+
+# ----------------------------------------------------------
+# PC1 Loadings Barplot
+# ----------------------------------------------------------
+loadings_df <- as.data.frame(pca_result$rotation)
+loadings_df$Protein <- rownames(loadings_df)
+
+ggplot(loadings_df, aes(x = reorder(Protein, PC1), y = PC1)) +
+  geom_bar(stat = "identity", fill = "black") +
+  coord_flip() +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "PC1 Loadings – ER-Positive DDR1 Pathway Module",
+    x = "Protein",
+    y = "PC1 Loading Weight"
+  )
+
+# ----------------------------------------------------------
+# Kaplan-Meier by PC1 (median split)
+# ----------------------------------------------------------
+data_ERpos$PC1_group <- ifelse(
+  data_ERpos$PC1 > median(data_ERpos$PC1),
+  "High PC1",
+  "Low PC1"
+)
+
+surv_obj <- Surv(data_ERpos$Survival_month, data_ERpos$DSS)
+
+fit_PC1 <- survfit(surv_obj ~ PC1_group, data = data_ERpos)
+
+ggsurvplot(
+  fit_PC1,
+  data = data_ERpos,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = FALSE,
+  palette = c("lightgray", "black"),
+  ggtheme = theme_classic(base_size = 14),
+  title = "ER-Positive Disease-Specific Survival by PC1"
+)
+
+# ----------------------------------------------------------
+# KM for DDR1 (median split)
+# ----------------------------------------------------------
+data_ERpos$DDR1_group <- ifelse(
+  data_ERpos$DDR1 > median(data_ERpos$DDR1),
+  "High DDR1",
+  "Low DDR1"
+)
+
+fit_DDR1 <- survfit(surv_obj ~ DDR1_group, data = data_ERpos)
+
+ggsurvplot(
+  fit_DDR1,
+  data = data_ERpos,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = FALSE,
+  palette = c("lightgray", "black"),
+  ggtheme = theme_classic(base_size = 14),
+  title = "ER-Positive Disease-Specific Survival by DDR1 Expression"
+)
+
+# ----------------------------------------------------------
+# KM for DARPP-32 Nuclear (median split)
+# ----------------------------------------------------------
+data_ERpos$DARPP32N_group <- ifelse(
+  data_ERpos$DARPP32_Nuclear > median(data_ERpos$DARPP32_Nuclear),
+  "High DARPP-32 Nuclear",
+  "Low DARPP-32 Nuclear"
+)
+
+fit_DARPP32 <- survfit(surv_obj ~ DARPP32N_group, data = data_ERpos)
+
+ggsurvplot(
+  fit_DARPP32,
+  data = data_ERpos,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = FALSE,
+  palette = c("lightgray", "black"),
+  ggtheme = theme_classic(base_size = 14),
+  title = "ER-Positive Disease-Specific Survival by DARPP-32 Nuclear"
+)
+
+# ----------------------------------------------------------
+# Scatterplot: DDR1 vs DARPP-32 Nuclear
+# ----------------------------------------------------------
+ggplot(data_ERpos, aes(x = DDR1, y = DARPP32_Nuclear)) +
+  geom_point(alpha = 0.5, color = "black") +
+  geom_smooth(method = "lm", se = TRUE, color = "lightgray") +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "ER-Positive DDR1 vs Nuclear DARPP-32",
+    x = "DDR1 H-score",
+    y = "DARPP-32 Nuclear H-score"
+  )
+
+# Count patients included in PCA
+n_patients <- nrow(data_ERpos)
+n_patients
+
