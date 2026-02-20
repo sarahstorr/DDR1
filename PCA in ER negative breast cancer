@@ -1,0 +1,92 @@
+# ==========================================================
+# ER-Negative PCA Using Individual Nuclear/Cytoplasmic Proteins
+# ==========================================================
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+# ----------------------------------------------------------
+# Define all individual proteins (nuclear and cytoplasmic separate)
+# ----------------------------------------------------------
+protein_cols <- c(
+  "CREB1",
+  "PhoshoT34_Cyto",
+  "PhosphoT34_Nuclear",
+  "PKA",
+  "DDR1",
+  "DARPP32_Cyto",
+  "DARPP32_Nuclear",
+  "PP1_Cyto",
+  "PP1_Nuclear",
+  "CDK5_Cyto",
+  "CDK5_Nuclear"
+)
+
+# ----------------------------------------------------------
+# Filter ER-negative patients
+# ----------------------------------------------------------
+data_ERneg <- data %>% filter(ER_status == 0)
+
+# Keep only complete cases for PCA
+data_ERneg <- data_ERneg[complete.cases(data_ERneg[, protein_cols]), ]
+
+# Count patients included
+n_ERneg <- nrow(data_ERneg)
+cat("Number of ER-negative patients with complete protein data: ", n_ERneg, "\n")
+
+# ----------------------------------------------------------
+# Standardize protein scores and run PCA
+# ----------------------------------------------------------
+protein_scaled <- scale(data_ERneg[, protein_cols])
+pca_result <- prcomp(protein_scaled, center = TRUE, scale. = TRUE)
+
+# Add PC1 scores to dataframe
+data_ERneg$PC1 <- pca_result$x[,1]
+
+# ----------------------------------------------------------
+# PC1 loadings barplot
+# ----------------------------------------------------------
+loadings_df <- as.data.frame(pca_result$rotation)
+loadings_df$Protein <- rownames(loadings_df)
+
+ggplot(loadings_df, aes(x = reorder(Protein, PC1), y = PC1)) +
+  geom_bar(stat = "identity", fill = "black") +
+  coord_flip() +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "ER-Negative: PC1 Loadings – Individual Proteins",
+    x = "Protein",
+    y = "PC1 Loading Weight"
+  )
+
+# ----------------------------------------------------------
+# Kaplan–Meier curves by PC1 (median split)
+# ----------------------------------------------------------
+data_ERneg$PC1_group <- ifelse(
+  data_ERneg$PC1 > median(data_ERneg$PC1),
+  "High PC1",
+  "Low PC1"
+)
+
+# Create survival object
+surv_obj <- Surv(data_ERneg$Survival_month, data_ERneg$DSS)
+
+# Fit KM curve
+fit_PC1 <- survfit(surv_obj ~ PC1_group, data = data_ERneg)
+
+# Plot KM curve
+ggsurvplot(
+  fit_PC1,
+  data = data_ERneg,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = FALSE,
+  palette = c("lightgray", "black"),
+  ggtheme = theme_classic(base_size = 14),
+  title = paste0("ER-Negative Disease-Specific Survival by PC1 (n = ", n_ERneg, ")")
+)
+
+# Count number of ER-negative patients with complete data for core proteins
+n_ERneg <- nrow(data_ERneg)
+n_ERneg  # prints the number of patients
