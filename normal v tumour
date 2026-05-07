@@ -1,0 +1,142 @@
+############################################################
+# STEP 0 — Install & load packages (run once)
+############################################################
+
+if (!requireNamespace("BiocManager")) install.packages("BiocManager")
+
+BiocManager::install(c("TCGAbiolinks", "SummarizedExperiment"), ask = FALSE, update = FALSE)
+install.packages("ggplot2")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(ggplot2)
+
+############################################################
+# STEP 1 — Download TCGA-BRCA RNA-seq (STAR counts)
+############################################################
+
+query <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts"
+)
+
+GDCdownload(query)
+data <- GDCprepare(query)
+
+############################################################
+# STEP 2 — Metadata + patient IDs
+############################################################
+
+meta <- as.data.frame(colData(data))
+meta$patient <- substr(meta$barcode, 1, 12)
+
+############################################################
+# STEP 3 — Identify matched tumour-normal pairs
+############################################################
+
+tumour <- meta[meta$shortLetterCode == "TP", ]
+normal <- meta[meta$shortLetterCode == "NT", ]
+
+paired_patients <- intersect(tumour$patient, normal$patient)
+
+cat("Matched patients:", length(paired_patients), "\n")
+
+############################################################
+# STEP 4 — Keep 1 tumour + 1 normal per patient
+############################################################
+
+paired_meta <- meta[meta$patient %in% paired_patients, ]
+paired_meta <- paired_meta[order(paired_meta$patient, paired_meta$shortLetterCode), ]
+
+paired_meta_unique <- do.call(rbind, lapply(split(paired_meta, paired_meta$patient), function(df) {
+  rbind(
+    df[df$shortLetterCode == "TP", ][1, ],
+    df[df$shortLetterCode == "NT", ][1, ]
+  )
+}))
+
+############################################################
+# STEP 5 — Expression matrix
+############################################################
+
+expr <- assay(data)[, paired_meta_unique$barcode]
+
+############################################################
+# STEP 6 — Gene selection
+############################################################
+
+gene_symbol <- "DDR1"
+gene_info <- as.data.frame(rowData(data))
+
+gene_idx <- which(gene_info$gene_name == gene_symbol)
+
+if (length(gene_idx) == 0) stop("Gene not found")
+
+############################################################
+# STEP 7 — Transform expression
+############################################################
+
+log_expr <- log2(expr + 1)
+gene_expr <- log_expr[gene_idx, ]
+
+############################################################
+# STEP 8 — Analysis dataframe
+############################################################
+
+df <- data.frame(
+  expression = as.numeric(gene_expr),
+  patient = paired_meta_unique$patient,
+  type = paired_meta_unique$shortLetterCode
+)
+
+df$type <- factor(df$type, levels = c("NT", "TP"),
+                  labels = c("Normal", "Cancer"))
+
+############################################################
+# STEP 9 — Paired statistical test
+############################################################
+
+tumour_vals <- df$expression[df$type == "Cancer"]
+normal_vals <- df$expression[df$type == "Normal"]
+
+t_result <- t.test(tumour_vals, normal_vals, paired = TRUE)
+pval <- t_result$p.value
+
+print(t_result)
+print(pval)
+
+############################################################
+# STEP 10 — Final figure (grayscale boxplot)
+############################################################
+
+ggplot(df, aes(x = type, y = expression, fill = type)) +
+  
+  geom_boxplot(
+    width = 0.6,
+    color = "black",
+    outlier.shape = NA
+  ) +
+  
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1) +
+  
+  scale_fill_manual(values = c(
+    "Normal" = "grey85",
+    "Cancer" = "grey60"
+  )) +
+  
+  theme_classic() +
+  
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 30, face = "bold"),
+    axis.title = element_text(size = 30),
+    axis.text = element_text(size = 30)
+  ) +
+  
+  labs(
+    title = paste0("TCGA-BRCA: Tumour vs Normal (paired)\nP = ", signif(pval, 3)),
+    x = "",
+    y = "log2(expression + 1)"
+  )
