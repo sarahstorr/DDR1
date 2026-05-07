@@ -1,0 +1,365 @@
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(tidyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+select <- dplyr::select
+filter <- dplyr::filter
+mutate <- dplyr::mutate
+
+
+
+BASE      <- 18   # base font size — increase if figures still look small
+AX_TITLE  <- 20  # axis title size
+AX_TEXT   <- 17  # axis tick label size
+GENE_SIZE <- 4.0  # gene label size (ggrepel units, ~11pt at 200dpi)
+
+pub_theme <- theme_bw(base_size = BASE) +
+  theme(
+    axis.title       = element_text(size = AX_TITLE, face = "bold"),
+    axis.text        = element_text(size = AX_TEXT,  colour = "black"),
+    legend.text      = element_text(size = BASE - 1),
+    legend.title     = element_text(size = BASE),
+    plot.title       = element_text(size = BASE + 1, face = "bold"),
+    plot.subtitle    = element_text(size = BASE - 2, colour = "grey45"),
+    strip.text       = element_text(size = BASE,     face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# =============================================================================
+# STEP 1 — Load data
+# =============================================================================
+
+t47d_path  <- r"(C:\Users\mrzsjs1\Desktop\DDR1 paper\supplementary file 1.xlsx)"
+igrov_path <- r"(C:\Users\mrzsjs1\Desktop\DDR1 paper\supplementary file 2.xlsx)"
+
+t47d_raw  <- read_excel(t47d_path)
+igrov_raw <- read_excel(igrov_path)
+
+cat("T47D raw rows:",   nrow(t47d_raw),  "\n")
+cat("IGROV1 raw rows:", nrow(igrov_raw), "\n")
+
+# =============================================================================
+# STEP 2 — Filter to significant DEGs
+# =============================================================================
+
+clean_degs <- function(df, label) {
+  df %>%
+    filter(!is.na(padj), !is.na(external_gene_name), external_gene_name != "") %>%
+    filter(padj < 0.05) %>%
+    mutate(
+      cell_line = label,
+      direction = ifelse(log2FoldChange > 0, "Up", "Down"),
+      abs_lfc   = abs(log2FoldChange)
+    ) %>%
+    group_by(external_gene_name) %>%
+    slice_min(padj, n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+t47d  <- clean_degs(t47d_raw,  "T47D")
+igrov <- clean_degs(igrov_raw, "IGROV1")
+
+cat("\nAfter filtering (padj < 0.05, one row per gene):\n")
+cat("  T47D:  ", nrow(t47d),  "genes |",
+    sum(t47d$direction  == "Up"), "up |", sum(t47d$direction  == "Down"), "down\n")
+cat("  IGROV1:", nrow(igrov), "genes |",
+    sum(igrov$direction == "Up"), "up |", sum(igrov$direction == "Down"), "down\n")
+
+# =============================================================================
+# STEP 3 — Overlap and directionality
+# =============================================================================
+
+core_genes <- intersect(t47d$external_gene_name, igrov$external_gene_name)
+cat("\nOverlapping genes:", length(core_genes), "\n")
+
+core_df <- t47d %>%
+  filter(external_gene_name %in% core_genes) %>%
+  select(external_gene_name, lfc_t47d = log2FoldChange, padj_t47d = padj) %>%
+  inner_join(
+    igrov %>%
+      filter(external_gene_name %in% core_genes) %>%
+      select(external_gene_name, lfc_igrov = log2FoldChange, padj_igrov = padj),
+    by = "external_gene_name"
+  ) %>%
+  mutate(
+    dir_t47d    = ifelse(lfc_t47d  > 0, "Up", "Down"),
+    dir_igrov   = ifelse(lfc_igrov > 0, "Up", "Down"),
+    concordance = ifelse(dir_t47d == dir_igrov, "Concordant", "Discordant")
+  )
+
+cat("\nCore gene directionality:\n")
+print(table(core_df$concordance))
+cat("\nBreakdown:\n")
+print(table(paste(core_df$dir_t47d, "in T47D /", core_df$dir_igrov, "in IGROV1")))
+
+concordant_genes <- core_df$external_gene_name[core_df$concordance == "Concordant"]
+discordant_genes <- core_df$external_gene_name[core_df$concordance == "Discordant"]
+t47d_specific    <- setdiff(t47d$external_gene_name,  core_genes)
+igrov_specific   <- setdiff(igrov$external_gene_name, core_genes)
+
+cat("\nConcordant core genes: ", length(concordant_genes), "\n")
+cat("Discordant core genes: ", length(discordant_genes),  "\n")
+cat("T47D-specific genes:   ", length(t47d_specific),     "\n")
+cat("IGROV1-specific genes: ", length(igrov_specific),    "\n")
+
+# =============================================================================
+# FIGURE 1 — Core gene directionality scatter
+# =============================================================================
+
+top_discord <- core_df %>%
+  filter(concordance == "Discordant") %>%
+  mutate(score = abs(lfc_t47d) + abs(lfc_igrov)) %>%
+  slice_max(score, n = 15)
+
+top_concord <- core_df %>%
+  filter(concordance == "Concordant") %>%
+  mutate(score = abs(lfc_t47d) + abs(lfc_igrov)) %>%
+  slice_max(score, n = 10)
+
+label_genes <- bind_rows(top_discord, top_concord)
+
+# Compute padded axis limits so corner annotations don't overlap points
+x_range <- range(core_df$lfc_t47d)
+y_range <- range(core_df$lfc_igrov)
+x_pad   <- diff(x_range) * 0.12
+y_pad   <- diff(y_range) * 0.12
+x_min   <- x_range[1] - x_pad;  x_max <- x_range[2] + x_pad
+y_min   <- y_range[1] - y_pad;  y_max <- y_range[2] + y_pad
+
+p_scatter <- ggplot(core_df,
+                    aes(x = lfc_t47d, y = lfc_igrov, colour = concordance)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey70", linewidth = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey70", linewidth = 0.5) +
+  geom_point(alpha = 0.75, size = 3) +
+  geom_text_repel(
+    data           = label_genes,
+    aes(label      = external_gene_name),
+    size           = GENE_SIZE,
+    fontface       = "bold.italic",
+    max.overlaps   = 25,
+    box.padding    = 0.45,
+    segment.colour = "grey50",
+    show.legend    = FALSE
+  ) +
+  scale_colour_manual(
+    values = c("Concordant" = "#2980B9", "Discordant" = "#E74C3C"),
+    name   = NULL,
+    labels = c(
+      paste0("Concordant (n=", length(concordant_genes), ")"),
+      paste0("Discordant (n=", length(discordant_genes), ")")
+    )
+  ) +
+  # Corner quadrant labels — sized to match axis text
+  annotate("text", x = x_max, y = y_max,
+           label = "Up in both",
+           colour = "#2980B9", size = GENE_SIZE + 0.5,
+           fontface = "bold.italic", hjust = 1, vjust = 1) +
+  annotate("text", x = x_min, y = y_min,
+           label = "Down in both",
+           colour = "#2980B9", size = GENE_SIZE + 0.5,
+           fontface = "bold.italic", hjust = 0, vjust = 0) +
+  annotate("text", x = x_max, y = y_min,
+           label = "Up T47D\nDown IGROV1",
+           colour = "#E74C3C", size = GENE_SIZE + 0.5,
+           fontface = "bold.italic", hjust = 1, vjust = 0) +
+  annotate("text", x = x_min, y = y_max,
+           label = "Down T47D\nUp IGROV1",
+           colour = "#E74C3C", size = GENE_SIZE + 0.5,
+           fontface = "bold.italic", hjust = 0, vjust = 1) +
+  coord_cartesian(xlim = c(x_min, x_max), ylim = c(y_min, y_max)) +
+  labs(
+    title    = "DDR1 Knockdown: Core Gene Directionality",
+    subtitle = paste0(length(core_genes),
+                      " genes shared between T47D and IGROV1  |  ",
+                      "Concordant n=", length(concordant_genes),
+                      "  Discordant n=", length(discordant_genes)),
+    x = expression(bold(log[2])~bold("Fold Change — T47D (ER+ breast)")),
+    y = expression(bold(log[2])~bold("Fold Change — IGROV1 (ovarian)"))
+  ) +
+  pub_theme +
+  theme(legend.position = "top",
+        legend.text     = element_text(size = BASE))
+
+print(p_scatter)
+
+# =============================================================================
+# FIGURE 2 & 3 — Volcano plots
+# =============================================================================
+
+make_volcano <- function(df_raw, label, top_n = 20) {
+  
+  plot_df <- df_raw %>%
+    filter(!is.na(padj), !is.na(external_gene_name), external_gene_name != "") %>%
+    mutate(
+      sig = case_when(
+        padj < 0.05 & log2FoldChange >  1 ~ "Up",
+        padj < 0.05 & log2FoldChange < -1 ~ "Down",
+        TRUE                               ~ "ns"
+      ),
+      neg_log10_padj = pmin(-log10(padj), 300)
+    )
+  
+  top_up   <- plot_df %>%
+    filter(sig == "Up")   %>% slice_max(abs(log2FoldChange), n = top_n / 2)
+  top_down <- plot_df %>%
+    filter(sig == "Down") %>% slice_max(abs(log2FoldChange), n = top_n / 2)
+  label_df <- bind_rows(top_up, top_down)
+  
+  n_up   <- sum(plot_df$sig == "Up",   na.rm = TRUE)
+  n_down <- sum(plot_df$sig == "Down", na.rm = TRUE)
+  
+  p <- ggplot(plot_df,
+              aes(x = log2FoldChange, y = neg_log10_padj, colour = sig)) +
+    geom_point(alpha = 0.5, size = 1.8) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+               colour = "grey50", linewidth = 0.6) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed",
+               colour = "grey50", linewidth = 0.6) +
+    geom_text_repel(
+      data           = label_df,
+      aes(label      = external_gene_name),
+      size           = GENE_SIZE,
+      fontface       = "bold.italic",
+      max.overlaps   = 30,
+      box.padding    = 0.4,
+      segment.colour = "grey55",
+      show.legend    = FALSE
+    ) +
+    scale_colour_manual(
+      values = c("Up" = "#E74C3C", "Down" = "#2980B9", "ns" = "grey75"),
+      labels = c(
+        "Up"   = paste0("Up (n=", n_up, ")"),
+        "Down" = paste0("Down (n=", n_down, ")"),
+        "ns"   = "n.s."
+      ),
+      name = NULL
+    ) +
+    labs(
+      title    = paste0("DDR1 Knockdown — ", label),
+      subtitle = expression("Highlighted: padj < 0.05 and |"*log[2]*"FC| > 1"),
+      x        = expression(bold(log[2])~bold("Fold Change (knockdown vs control)")),
+      y        = expression(bold(-log[10])~bold("(adjusted p-value)"))
+    ) +
+    pub_theme +
+    theme(legend.position = "top",
+          legend.text     = element_text(size = BASE))
+  
+  print(p)
+}
+
+make_volcano(t47d_raw,  "T47D (ER+ Breast)")
+make_volcano(igrov_raw, "IGROV1 (Ovarian)")
+
+# =============================================================================
+# FIGURES 4-7 — KEGG enrichment dotplots
+# =============================================================================
+
+run_kegg <- function(gene_symbols, label) {
+  
+  if (length(gene_symbols) < 10) {
+    cat("  SKIP KEGG for", label, "— too few genes\n")
+    return(invisible(NULL))
+  }
+  
+  entrez <- bitr(gene_symbols,
+                 fromType = "SYMBOL",
+                 toType   = "ENTREZID",
+                 OrgDb    = org.Hs.eg.db,
+                 drop     = TRUE)
+  
+  cat("  KEGG", label, ": mapped", nrow(entrez), "of",
+      length(gene_symbols), "genes to Entrez\n")
+  
+  if (nrow(entrez) < 10) return(invisible(NULL))
+  
+  ekegg <- enrichKEGG(
+    gene          = entrez$ENTREZID,
+    organism      = "hsa",
+    pAdjustMethod = "BH",
+    pvalueCutoff  = 0.05
+  )
+  
+  if (is.null(ekegg) || nrow(ekegg@result) == 0) {
+    cat("  No significant KEGG pathways for", label, "\n")
+    return(invisible(NULL))
+  }
+  
+  n_paths <- nrow(ekegg@result[ekegg@result$p.adjust < 0.05, ])
+  cat("  Significant KEGG pathways for", label, ":", n_paths, "\n")
+  
+  p <- dotplot(ekegg, showCategory = 20, font.size = AX_TEXT - 2) +
+    labs(
+      title    = paste0("KEGG Pathways — ", label),
+      subtitle = paste0(n_paths, " significant pathways (padj < 0.05)")
+    ) +
+    theme_bw(base_size = BASE) +
+    theme(
+      plot.title    = element_text(size = BASE + 1, face = "bold"),
+      plot.subtitle = element_text(size = BASE - 2, colour = "grey45"),
+      axis.title.x  = element_text(size = AX_TITLE, face = "bold"),
+      axis.text.x   = element_text(size = AX_TEXT),
+      axis.text.y   = element_text(size = AX_TEXT),   # pathway name size
+      legend.text   = element_text(size = BASE - 2),
+      legend.title  = element_text(size = BASE - 1),
+      panel.grid.minor = element_blank()
+    )
+  
+  print(p)
+  invisible(ekegg)
+}
+
+cat("\n=== KEGG Pathway Enrichment ===\n")
+
+cat("\n-- T47D-specific genes --\n")
+kegg_t47d <- run_kegg(t47d_specific, "T47D-specific")
+
+cat("\n-- IGROV1-specific genes --\n")
+kegg_igrov <- run_kegg(igrov_specific, "IGROV1-specific")
+
+cat("\n-- Concordant core genes --\n")
+kegg_concordant <- run_kegg(concordant_genes, "Concordant core")
+
+cat("\n-- Discordant core genes --\n")
+kegg_discordant <- run_kegg(discordant_genes, "Discordant core")
+
+# =============================================================================
+# CONSOLE SUMMARY
+# =============================================================================
+
+cat("\n=== ANALYSIS COMPLETE ===\n")
+cat("Figures in RStudio Plots pane — use arrows to scroll.\n\n")
+cat("  Figure 1: Core gene directionality scatter\n")
+cat("  Figure 2: Volcano — T47D\n")
+cat("  Figure 3: Volcano — IGROV1\n")
+cat("  Figure 4: KEGG — T47D-specific\n")
+cat("  Figure 5: KEGG — IGROV1-specific\n")
+cat("  Figure 6: KEGG — Concordant core\n")
+cat("  Figure 7: KEGG — Discordant core\n\n")
+
+cat("Gene list summary:\n")
+cat("  T47D total DEGs:    ", nrow(t47d),               "\n")
+cat("  IGROV1 total DEGs:  ", nrow(igrov),              "\n")
+cat("  Core overlap:       ", length(core_genes),       "\n")
+cat("    Concordant:       ", length(concordant_genes),  "\n")
+cat("    Discordant:       ", length(discordant_genes),  "\n")
+cat("  T47D-specific:      ", length(t47d_specific),    "\n")
+cat("  IGROV1-specific:    ", length(igrov_specific),   "\n")
+
+cat("\nTop discordant genes (ranked by sum of |LFC|):\n")
+core_df %>%
+  filter(concordance == "Discordant") %>%
+  mutate(abs_sum = abs(lfc_t47d) + abs(lfc_igrov)) %>%
+  arrange(desc(abs_sum)) %>%
+  select(Gene       = external_gene_name,
+         LFC_T47D   = lfc_t47d,
+         LFC_IGROV1 = lfc_igrov,
+         Dir_T47D   = dir_t47d,
+         Dir_IGROV1 = dir_igrov) %>%
+  head(15) %>%
+  print(digits = 3)
